@@ -1,0 +1,268 @@
+---
+title: "A0_Descriptivos"
+author: "VGiaconi"
+date: "2026-10-06"
+output: html_document
+---
+
+**Qué hace:** describe los indicadores candidatos, los compara entre sectores urbanos y rurales
+.
+
+**Entrada:** `escuelas_con_longitud_latitud_completadas_IDok.csv` (salida de B1).
+
+**Salida:** Solo resultados.
+
+**Orden de la serie:** B0 (geografía) → B1 (variables censales por sector) → A0 (descriptivos) → A1 (índice de ruralidad).
+
+**Comentarios dentro de los chunks:** `# NOTA:` explica
+
+
+# 1. Lectura y preparación de datos
+
+```{r setup}
+library(lavaan)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(GGally)
+
+path_in <- "RUTA/A/TU/CARPETA/Proyecto Indice de Ruralidad de Escuelas/"
+
+#datos escuelas
+dat_schools<-read.csv2(paste(path_in,"Base de datos/escuelas_con_longitud_latitud_completadas_IDok.csv",sep=""))
+```
+
+# 2. Descriptivos
+
+## 2.1 Variables a describir
+
+`vars_desc` (descriptivos univariados y correlaciones) reúne porcentajes y las dos versiones de la densidad; `vars_modelo` (comparación con `AREA_C`) son los indicadores candidatos del índice. 
+
+```{r vars}
+vars_desc <- c(
+  "pct_n_ciuo_6",
+  "pct_n_caenes_A",
+  "pct_n_fuente_agua_publica",
+  "pct_n_fuente_agua_pozo",
+  "pct_n_fuente_agua_camion",
+  "pct_n_fuente_agua_rio",
+  "pct_n_fuente_elect_publica",
+  "pct_n_basura_servicios",
+  "pct_n_serv_internet_fija",
+  "pct_n_serv_internet_movil",
+  "pct_n_serv_internet_satelital",
+  "pct_n_serv_hig_alcantarillado_nuevavar",
+  "pct_n_comb_cocina_lenaymas_nuevavar",
+  "pct_n_comb_calefaccion_lenaymas_nuevavar",
+  "dens_sector_km2",
+  "log_dens_sector_km2",
+  "log_dist_limite_m"
+)
+
+vars_modelo <- c(
+  "pct_n_caenes_A",
+  "pct_n_fuente_agua_publica",
+  "pct_n_fuente_elect_publica",
+  "pct_n_basura_servicios",
+  "pct_n_serv_internet_fija",
+  "pct_n_serv_hig_alcantarillado_nuevavar",
+  "pct_n_comb_calefaccion_lenaymas_nuevavar",
+  "log_dens_sector_km2",
+  "log_dist_limite_m"
+)
+```
+
+```{r largo}
+# Formato largo reutilizable (sin AREA_C)
+# NOTA: Los gráficos univariados usan vars_desc, así que no incluyen log_dist_limite_m.
+dat_long_uni <- dat_schools %>%
+  select(all_of(vars_desc)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valor")
+
+# Formato largo con AREA_C (1 = urbano, 2 = rural; ajustar si es al revés)
+dat_long <- dat_schools %>%
+  select(AREA_C, all_of(vars_modelo)) %>%
+  mutate(AREA_C = factor(AREA_C, levels = c(1, 2),
+                         labels = c("Urbano", "Rural"))) %>%
+  pivot_longer(-AREA_C, names_to = "variable", values_to = "valor")
+```
+
+## 2.2 Descriptivos univariados
+
+### 2.2.1 Tabla resumen
+
+`pct_ceros` indica el porcentaje de observaciones con valor 0, útil para detectar variables con mucha masa en cero (por ejemplo agua de río o internet satelital).
+
+```{r desc_uni}
+desc_uni <- dat_long_uni %>%
+  group_by(variable) %>%
+  summarise(
+    n         = sum(!is.na(valor)),
+    n_na      = sum(is.na(valor)),
+    media     = mean(valor, na.rm = TRUE),
+    de        = sd(valor, na.rm = TRUE),
+    min       = min(valor, na.rm = TRUE),
+    p25       = quantile(valor, 0.25, na.rm = TRUE),
+    mediana   = median(valor, na.rm = TRUE),
+    p75       = quantile(valor, 0.75, na.rm = TRUE),
+    max       = max(valor, na.rm = TRUE),
+    asimetria = {
+      x <- valor[!is.na(valor)]
+      mean((x - mean(x))^3) / sd(x)^3
+    },
+    pct_ceros = mean(valor == 0, na.rm = TRUE) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+desc_uni
+```
+
+### 2.2.2 Histogramas
+
+```{r hist, fig.height=10}
+# NOTA: El eje x dice 'Porcentaje', pero vars_desc incluye densidad y su logaritmo, que
+#   no son porcentajes.
+ggplot(dat_long_uni, aes(x = valor)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 4) +
+  labs(x = "Porcentaje", y = "Frecuencia") +
+  theme_minimal(base_size = 9)
+```
+
+### 2.2.3 Violin y boxplot
+
+```{r violin_uni, fig.height=10}
+ggplot(dat_long_uni, aes(x = "", y = valor)) +
+  geom_violin(fill = "steelblue", alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.6, outlier.alpha = 0.4) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  labs(x = NULL, y = "Porcentaje") +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_blank())
+```
+
+## 2.3 Descriptivos bivariados entre indicadores
+
+### 2.3.1 Matriz de correlaciones
+
+Se usa Spearman como medida principal por la asimetría esperable en porcentajes, y Pearson para comparar.
+
+```{r cor}
+cor_sp <- cor(dat_schools[, vars_desc], use = "pairwise.complete.obs",
+              method = "spearman")
+cor_pe <- cor(dat_schools[, vars_desc], use = "pairwise.complete.obs",
+              method = "pearson")
+
+round(cor_sp, 2)
+```
+
+### 2.3.2 Mapa de calor (Spearman)
+
+```{r heatmap, fig.width=12, fig.height=11}
+cor_long <- as.data.frame(as.table(cor_sp)) %>%
+  setNames(c("v1", "v2", "rho"))
+
+ggplot(cor_long, aes(x = v1, y = v2, fill = rho)) +
+  geom_tile() +
+  geom_text(aes(label = round(rho, 2)), size = 2) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(x = NULL, y = NULL, fill = "Spearman") +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+### 2.3.3 Pares más correlacionados
+
+Útil para detectar redundancia antes de armar el índice.
+
+```{r pares}
+pares_cor <- cor_long %>%
+  filter(as.character(v1) < as.character(v2)) %>%
+  mutate(abs_rho = abs(rho)) %>%
+  arrange(desc(abs_rho))
+
+head(pares_cor, 20)
+```
+
+
+## 2.4 Comparación urbano-rural (AREA_C)
+
+Se asume `AREA_C`: 1 = urbano, 2 = rural.
+
+### 2.4.1 Tabla comparativa por grupo
+
+```{r n_area}
+## Tamaño de n por grupo
+table(dat_schools$AREA_C, useNA = "ifany")
+
+## Tabla comparativa con test y tamaño de efecto
+
+#`rb_efecto` es la correlación biserial por rangos (de -1 a 1). Valores positivos indican valores más altos en el grupo rural. Referencia rápida: |0.1| pequeño, |0.3| mediano, |0.5| grande. Con muestras grandes casi todo sale significativo, por lo que conviene priorizar el tamaño de efecto por sobre el p-valor.
+
+# NOTA: rb_efecto = 2*W/(n1*n2) - 1 es la correlación biserial por rangos (equivale a
+#   2*AUC - 1); positivo = valores más altos en rural. La fórmula es correcta. Los
+#   p-valores son optimistas porque escuelas del mismo sector comparten valor.
+
+comparar_area <- function(x, g) {
+  ok <- !is.na(x) & !is.na(g)
+  x <- x[ok]; g <- g[ok]
+  x_u <- x[g == 1]; x_r <- x[g == 2]
+  w <- suppressWarnings(wilcox.test(x_r, x_u, exact = FALSE))
+  tibble(
+    n_urbano    = length(x_u),
+    n_rural     = length(x_r),
+    media_urb   = mean(x_u),
+    media_rur   = mean(x_r),
+    mediana_urb = median(x_u),
+    mediana_rur = median(x_r),
+    dif_medias  = mean(x_r) - mean(x_u),
+    rb_efecto   = 2 * unname(w$statistic) / (length(x_r) * length(x_u)) - 1,
+    p_wilcoxon  = w$p.value
+  )
+}
+
+bivar_area <- lapply(vars_modelo, function(v) {
+  comparar_area(dat_schools[[v]], dat_schools$AREA_C) %>%
+    mutate(variable = v, .before = 1)
+}) %>%
+  bind_rows() %>%
+  mutate(p_adj = p.adjust(p_wilcoxon, method = "holm"),
+         across(where(is.numeric) & !c(n_urbano, n_rural, p_wilcoxon, p_adj),
+                ~ round(.x, 2))) %>%
+  arrange(desc(abs(rb_efecto)))
+
+bivar_area
+```
+
+### 2.4.2 Violin y boxplot por AREA_C
+
+```{r violin_area, fig.height=10}
+ggplot(dat_long, aes(x = AREA_C, y = valor, fill = AREA_C)) +
+  geom_violin(alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.15, outlier.size = 0.6, outlier.alpha = 0.4,
+               fill = "white") +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = c("Urbano" = "steelblue", "Rural" = "darkorange")) +
+  labs(x = NULL, y = "Porcentaje") +
+  theme_minimal(base_size = 9) +
+  theme(legend.position = "none")
+```
+
+### 2.4.3 Correlación con AREA_C (Spearman, rural = 1)
+
+```{r cor_area}
+# REVISAR: Usa vars_desc, mientras la tabla comparativa de 2.4.1 usa vars_modelo
+#   (sugerencia 5).
+cor_area <- sapply(vars_desc, function(v) {
+  cor(dat_schools[[v]], as.numeric(dat_schools$AREA_C == 2),
+      use = "pairwise.complete.obs", method = "spearman")
+})
+
+sort(round(cor_area, 2), decreasing = TRUE)
+```
+
+
+

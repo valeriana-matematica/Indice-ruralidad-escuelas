@@ -1,0 +1,610 @@
+---
+title: "B0_Datos_geograficos"
+author: "VGiaconi"
+date: "2026-10-06"
+output: html_document
+---
+
+# Resumen del script
+
+**Qué hace:** ubica cada escuela en su sector censal (zona urbana o localidad rural) usando la cartografía del Censo 2024, y calcula dos variables por escuela: la densidad poblacional de su sector y la distancia al límite urbano más cercano.
+
+**Entradas:** directorio de escuelas y tres capas parquet del Censo 2024 (zonal, localidades y límite urbano).
+
+**Salida:** `escuelas_con_longitud_latitud_completadas_ID.csv`, una fila por escuela y sin geometría. Es la entrada del script B1.
+
+**Orden de la serie:** B0 (geografía) → B1 (variables censales por sector) → A1 (índice de ruralidad).
+
+**Comentarios dentro de los chunks:** `# NOTA:` explica qué hace el código o por qué; 
+
+# 1. Paquetes y rutas
+
+```{r paquetes}
+library(sf)
+library(dplyr)
+library(arrow)
+library(sfarrow)
+
+path_in <- "RUTA/A/TU/CARPETA/Proyecto Indice de Ruralidad de Escuelas/"
+```
+
+# 2. Capas cartográficas
+
+Se leen las tres capas del Censo 2024. Los parquet llegan sin CRS reconocido por `sfarrow` (`st_crs()` da `NA`), pero los metadatos GeoParquet declaran SIRGAS 2000 (sistema geográfico, prácticamente igual a WGS84). Por eso se asigna 4326 con `st_set_crs()`, que **asigna** el sistema sin mover coordenadas (no es una transformación).
+
+```{r capas}
+zonas       <- st_read_parquet(paste0(path_in,"/Base de datos/Cartografia_censo2024_Pais/Cartografia_censo2024_Pais_Zonal.parquet"))
+localidades <- st_read_parquet(paste0(path_in,"/Base de datos/Cartografia_censo2024_Pais/Cartografia_censo2024_Pais_Localidades.parquet"))
+limite <- st_read_parquet(paste0(path_in,"/Base de datos/Cartografia_censo2024_Pais/Cartografia_censo2024_Pais_Limite_Urbano.parquet"))
+
+st_crs(limite)                         # puede salir NA, igual que en las otras capas
+limite   <- st_set_crs(limite, 4326)   # SIRGAS 2000 ~ WGS84
+# NOTA: select() deja solo identificadores y nombre de la entidad urbana; n_per queda
+#   disponible por si se quiere usar el tamaño de la ciudad.
+limite_v <- st_make_valid(limite) %>%
+  select(any_of(c("ID_LOCALIDAD", "LOCALIDAD", "ENTIDAD", "CONURBACION", "n_per")))
+
+
+zonas_v     <- st_set_crs(zonas, 4326)
+loc_v       <- st_set_crs(localidades, 4326)
+
+zonas_v <- st_make_valid(zonas_v)
+loc_v <- st_make_valid(loc_v)
+
+
+
+# NOTA: Bloque de diagnóstico: nombres de columnas, CRS y validez de geometrías antes y
+#   después de reparar. 
+names(zonas_v); names(loc_v)   # nombres de las columnas de ID                            # sistema de coordenadas
+st_crs(zonas_v)                                     # sistema de coordenadas
+st_crs(loc_v)                                     # sistema de coordenadas
+table(st_is_valid(zonas))                         # geometrias validas
+table(st_is_valid(zonas_v))                         # geometrias validas
+table(st_is_valid(localidades))                         # geometrias validas
+table(st_is_valid(loc_v))                         # geometrias validas
+
+```
+
+# 3. Directorio de escuelas
+
+Se filtran establecimientos en funcionamiento y se reconstruyen las coordenadas, que en el CSV vienen con separadores de miles en lugar de decimales.
+
+```{r escuelas}
+ee<-read.csv2(paste0(path_in,"Base de datos/Directorio Oficial EE 2024/20240912_Directorio_Oficial_EE_2024_20240430_WEB.csv"))
+
+# ee base de directorio escuelas que debería cargar
+# NOTA: ESTADO_ESTAB == 1 deja solo establecimientos en funcionamiento (de 16.694 a
+#   12.037 filas).
+ee<- ee %>%
+  filter(ESTADO_ESTAB==1) 
+
+# NOTA: En el CSV las coordenadas vienen como '-18,487,200,000,...' (la coma es
+#   separador de miles, no decimal). arreglar_coord() se queda con los dígitos y pone el
+#   decimal después de los 2 primeros (3 en longitudes de Rapa Nui). Los valores de un
+#   solo carácter ('0' y similares) quedan como NA.
+# eliminar perdidos
+arreglar_coord <- function(x, tipo = c("lat", "lon")) {
+  tipo <- match.arg(tipo)
+  x <- as.character(x)
+  neg <- grepl("^-", x)
+  d <- gsub("[^0-9]", "", x)                      # solo digitos
+  ok <- !is.na(d) & nchar(d) >= 3                 # descarta "0", "" y similares
+
+  n_ent <- rep(2L, length(d))
+  if (tipo == "lon") {
+    # longitudes con 3 enteros (Rapa Nui, ~ -109): los dos primeros digitos < 66
+    n_ent <- ifelse(ok & as.numeric(substr(d, 1, 2)) < 66, 3L, 2L)
+  }
+
+  v <- rep(NA_real_, length(d))
+  v[ok] <- as.numeric(paste0(substr(d[ok], 1, n_ent[ok]), ".",
+                             substr(d[ok], n_ent[ok] + 1, nchar(d[ok]))))
+  ifelse(neg, -v, v)
+}
+ee <- ee %>%
+  mutate(
+    LATITUD  = arreglar_coord(LATITUD,  "lat"),
+    LONGITUD = arreglar_coord(LONGITUD, "lon")
+  )
+
+# Se identificaron varias escuelas con LONGITUD y LATITUD incorrectas, muchas de nivel preescolar y nuevas. Buscamos manualmente sus respectivas latitudes y longitudes y se las asignamos
+# Escuelas: 176 (clave: RBD).
+coord_manual <- tribble(
+  ~RBD, ~LATITUD, ~LONGITUD,
+  13207, -38.67053157154983, -72.22832843573717, # ESCUELA ESPECIAL DE LENGUAJE EL CASTILLO DE VILCUN (VILCUN)
+  20337, -35.42234998984824, -71.66193693278555, # SALA CUNA Y JARDIN INFANTIL CAPULLITO (TALCA)
+  20521, -34.597957631878394, -70.9962602743682, # JARDIN INFANTIL ALMINAR (SAN FERNANDO)
+  31235, -34.57822944726317, -71.0044702705125, # JARDIN INFANTIL PEUMAYEN SAN FERNANDO (SAN FERNANDO)
+  41707, -32.993487691552914, -71.49818474559176, # SALA CUNA ANGEL (VINA DEL MAR)
+  41772, -33.276372098192674, -70.65614416749658, # JARDIN INFANTIL ALFALFA (COLINA)
+  41789, -39.27208808604688, -71.97682238495895, # JARDIN INFANTIL MANDARINA (PUCON)
+  41835, -33.01779804313356, -71.54457678470075, # JARDIN INFANTIL TIA MARCELA (VINA DEL MAR)
+  41838, -33.45607743878748, -70.84643581674248, # JARDIN INFANTIL VALLE DE LUZ (PUDAHUEL)
+  41839, -33.46686722271832, -70.6267331590672, # CENTRO VITAMINA NUBLE (SANTIAGO)
+  41840, -30.599512072069356, -71.19713285456615, # SALA CUNA Y JARDIN INFANTIL AGUAYMANTO (OVALLE)
+  41841, -29.907186273043397, -71.25049806578137, # SALA CUNA Y JARDIN INFANTIL FRANCISCO DE ASIS (LA SERENA)
+  41843, -22.436284212107036, -68.92274226126085, # JARDIN INFANTIL LA HORMIGUITA (CALAMA)
+  41844, -33.46530062035678, -70.5867275167388, # JARDIN INFANTIL MICIFUZ (NUNOA)
+  41847, -33.54010063629673, -70.79013917912782, # JARDIN INFANTIL MIS POLLITOS (MAIPU)
+  41849, -33.73028926855839, -70.73851934974364, # JARDIN INFANTIL ECOEDRO (BUIN)
+  41850, -29.93437282867788, -71.2599638111355, # SALA CUNA Y JARDIN INFANTIL MI GRANJA (LA SERENA)
+  41858, -53.163011157368864, -70.9022280757115, # SALA CUNA SEMILLITA (PUNTA ARENAS)
+  41860, -33.45555824928097, -70.62051006139774, # JARDIN INFANTIL Y SALA CUNA HUELLITAS (NUNOA)
+  41864, -36.81543634496668, -73.02748338309483, # SALA CUNA Y JARDIN INFANTIL TAMBORCITO (CONCEPCION)
+  41868, -33.44296568578195, -70.60510563071212, # JARDIN INFANTIL GROWING UP (PROVIDENCIA)
+  41869, -33.44857039830222, -70.6022357320823, # JARDIN INFANTIL Y SALA CUNA GREENAPPLE (PROVIDENCIA)
+  41870, -22.452249183872297, -68.91368669009607, # GREEN APPLE SERVICIOS EDUCATIVOS SPA (CALAMA)
+  41877, -33.43414325369332, -70.54406622665401, # JARDIN INFANTIL GROWING TREE (LA REINA)
+  41878, -33.35232233812034, -70.5258684194399, # JARDIN INFANTIL POKI PLAY (LO BARNECHEA)
+  41880, -27.381363778087216, -70.31210885767152, # JARDIN INFANTIL MI PEQUENO MUNDO (COPIAPO)
+  41881, -22.453240478643192, -68.91849567596604, # SALA CUNA GABRIELA MISTRAL (CALAMA)
+  41883, -33.452435394353884, -70.66172396139785, # SALA CUNA Y JARDIN INFANTIL AMANECER (SANTIAGO)
+  41888, -42.47702318581954, -73.76897174868436, # ESCUELA HOSPITALARIA CHILOE (CASTRO)
+  41904, -33.517497390842266, -70.715498930709, # CENTRO VITAMINA MALL PLAZA OESTE (CERRILLOS)
+  41907, -33.3689846062519, -70.7316753196328, # SALA CUNA Y JARDIN INFANTIL QUERUBINES (QUILICURA)
+  41908, -33.1228848633247, -71.5699991190832, # JARDIN INFANTIL Y SALA CUNA LITTLE FOREST (VALPARAISO)
+  41909, -37.47122814119271, -72.34481532034619, # SALA CUNA JARDIN INFANTIL PIOLIN (LOS ANGELES)
+  41912, -33.1232929785159, -71.57098004421826, # JARDIN INFANTIL MONTESSORI ALIWEN (VALPARAISO)
+  41913, -33.45487990168327, -70.70807241721887, # SALA CUNA MY LITTLE HOME (LO PRADO)
+  41914, -40.57702515756923, -73.12126357275318, # SALA CUNA Y JARDIN PASO A PASO (OSORNO)
+  41917, -32.8421962297577, -70.95492263073727, # ESCUELA HOSPITALARIA SAN FRANCISCO (LLAILLAY)
+  41918, -33.52459392073818, -70.59938343255898, # SALA CUNA Y JARDIN INFANTIL PANGUI (LA FLORIDA)
+  41921, -33.39074526813901, -70.5277149865355, # JARDIN INFANTIL BAMBU (LAS CONDES)
+  41923, -29.91641128392302, -71.25443020337002, # SALA CUNA Y JARDIN INFANTIL LITTLE SMILES (LA SERENA)
+  41925, -33.3889251441383, -70.52596467674351, # JARDIN INFANTIL WALDORF GABRIELA MISTRAL (LAS CONDES)
+  41926, -33.04943203736083, -71.44522318469949, # JARDIN INFANTIL Y SALA CUNA SUENOS MAGICOS (QUILPUE)
+  41928, -27.373935020289654, -70.32196925820271, # SALA CUNA HOSPITAL REGIONAL DE COPIAPO (COPIAPO)
+  41930, -30.60553290081416, -71.20774524617025, # JARDIN INFANTIL GREEN GARDEN (OVALLE)
+  41937, -33.413693062909644, -70.57437282701265, # CREAR JARDINES INFANTILES SEDE ROSA OHIGGINS (LAS CONDES)
+  41939, -41.44632027211808, -72.95742392424867, # JARDIN HPM (PUERTO MONTT)
+  41942, -29.914890579795443, -71.25435872850518, # SALA CUNA Y JARDIN INFANTIL MIS PRIMEROS PASOS (LA SERENA)
+  41948, -32.9649559492044, -71.5420819865533, # SALA CUNA Y JARDIN INFANTIL AMAZING CENTER (VINA DEL MAR)
+  41949, -33.35415804682646, -70.67867204285342, # CENTRO VITAMINA HUECHURABA (HUECHURABA)
+  41950, -33.44208143182238, -70.60115187441119, # SALA CUNA Y JARDIN INFANTIL EL INGENIO (PROVIDENCIA)
+  41953, -33.44259149536671, -70.5621256302323, # SALA CUNA Y JARDIN INFANTIL MI GIRASOL (LA REINA)
+  41954, -34.73032888141013, -71.65209290552181, # SALA CUNA Y JARDIN INFANTIL ANGELITOS (LOLOL)
+  41957, -33.0476245080695, -71.42090843072866, # CENTRO VITAMINA EL BELLOTO (QUILPUE)
+  41958, -33.431419544686776, -70.61295503349922, # CENTRO VITAMINA PROVIDENCIA (PROVIDENCIA)
+  41959, -33.41465824324326, -70.60016823256369, # CENTRO VITAMINA SAN SEBASTIAN (LAS CONDES)
+  41960, -33.51215617437818, -70.75785314790251, # CENTRO VITAMINA PLAZA DE MAIPU (MAIPU)
+  41961, -37.79434631033005, -72.70530584540685, # SALA CUNA LOS PATITOS (ANGOL)
+  41962, -40.30578152504638, -72.68658874381158, # JARDIN INFANTIL Y SALA CUNA CAYURRUCA (RIO BUENO)
+  41967, -33.411593758581034, -70.56985377304191, # SALA CUNA Y JARDIN INFANTIL KIKIRIKIDS (LAS CONDES)
+  41968, -33.045039839325895, -71.44317560795164, # CENTRO VITAMINA QUILPUE (QUILPUE)
+  41970, -33.430850383318926, -70.59724757441157, # JARDIN INFANTIL ATAMARI (PROVIDENCIA)
+  41976, -40.40092670431066, -72.711994262976, # JARDIN INFANTIL RAYITO DE SOL TRAPI (RIO BUENO)
+  41979, -36.55046559603211, -72.00291407105391, # SALA CUNA Y JARDIN INFANTIL SEMILLITAS (CHILLAN)
+  41981, -36.62129625586445, -72.06680385913725, # SALA CUNA Y JARDIN INFANTIL MIS PRIMEROS SUENOS (CHILLAN)
+  41982, -39.72610493899196, -73.39567073183376, # PEEWE PEWMA (VALDIVIA)
+  41983, -40.34598367090614, -72.94526781646428, # JARDIN INFANTIL Y SALA CUNA PADRE HURTADO (RIO BUENO)
+  41990, -29.919924091095666, -71.2119231322056, # SALA CUNA Y JARDIN INFANTIL ABEJITA KIDS (LA SERENA)
+  41999, -33.42406412880228, -70.57343932516189, # SALA CUNA CALIDOSCOPIO DEL MINISTERIO DE HACIENDA (SANTIAGO)
+  42001, -23.589229029572888, -70.39051597472366, # SOCIEDAD EDUCACIONAL WORLD CHILDREN (ANTOFAGASTA)
+  42002, -36.60379520217913, -72.10162085940905, # SALA CUNA Y JARDIN INFANTIL TORTUGUITA (CHILLAN)
+  42010, -33.521482629867506, -70.56391923255914, # JARDIN INFANTIL COLORES (LA FLORIDA)
+  42011, -33.45686768516499, -70.61558278958574, # SALA CUNA Y JARDIN INFANTIL RAYUN (NUNOA)
+  42016, -36.612168845650736, -72.07223721846897, # SALA CUNA Y JARDIN INFANTIL PASITOS AL FUTURO (CHILLAN)
+  42020, -33.591474590350074, -70.70766701721314, # SALA CUNA Y JARDIN INFANTIL DESPERTARES (SAN BERNARDO)
+  42025, -33.40671932341246, -70.51933985291753, # JARDIN INFANTIL OTONAL (LAS CONDES)
+  42026, -23.674221993505405, -70.40934800223329, # SALA CUNA Y ESCUELA DE PARVULOS PAPELUCHOS (ANTOFAGASTA)
+  42029, -32.899668086834815, -71.25307330222412, # COLEGIO CANEC HOSPITAL DE QUILLOTA (QUILLOTA)
+  42030, -34.17448640861, -70.66132679418398, # JARDIN INFANTIL Y SALA CUNA EL MAITEN (MACHALI)
+  42033, -34.28352880946947, -70.83348772906908, # JARDIN INFANTIL Y SALA CUNA PEQUENOS TESOROS (REQUINOA)
+  42034, -34.317787038910964, -70.82812238924636, # SALA CUNA LAS POLILLITAS (REQUINOA)
+  42037, -33.50771706540884, -70.55855101673718, # JARDIN INFANTIL MIS COMIENZOS (PENALOLEN)
+  42038, -33.59721060773487, -70.54677854604861, # JARDIN INFANTIL Y SALA CUNA DEL VALLE (PUENTE ALTO)
+  42040, -33.44423005307742, -70.63219452482218, # SALA CUNA ANEXA AL LUGAR DE TRABAJO ASOCIACION CHILENA DE SEGURIDAD (PROVIDENCIA)
+  42041, -36.84939787599876, -73.09375767361816, # ESCUELA DE LENGUAJE ANDALUE (SAN PEDRO DE LA PAZ)
+  42043, -38.07891062077342, -72.33554873323146, # SALA CUNA BAMBI (VICTORIA)
+  42044, -39.510587956619595, -72.46813981349271, # JARDIN INFANTIL Y SALA CUNA WELIWEN DE ANTILHUE (LANCO)
+  42050, -33.45604390832788, -70.58839574790487, # JARDIN INFANTIL CONCIENCIA (NUNOA)
+  42052, -33.4018477059027, -70.5602756879054, # JARDIN INFANTIL CASA ARCOIRIS LIMITADA (LAS CONDES)
+  42055, -41.44512830684853, -72.93882434710252, # SALA CUNA GOSHEN (PUERTO MONTT)
+  42056, -29.960485233326562, -71.2618977480455, # SALA CUNA Y JARDIN INFANTIL ALIWEN (COQUIMBO)
+  42060, -27.354080124937305, -70.35127104232848, # JARDIN INFANTIL REMOLINO (COPIAPO)
+  42063, -34.29183421154932, -71.30797116649411, # SALA CUNA Y JARDIN INFANTIL GIRASOL (LAS CABRAS)
+  42065, -36.42887936193717, -71.96350272171837, # JARDIN INFANTIL TIC TAC (SAN CARLOS)
+  42067, -39.83494177333752, -73.20202712476129, # INDEPENDENCIA (VALDIVIA)
+  42071, -40.598777070293636, -73.2671555452891, # INSTITUTO DE EDUCACION DE ADULTOS MONTANA NEVADA (OSORNO)
+  42072, -39.7344706602523, -73.13109192988483, # JARDIN INFANTIL ESTRELLITA NUESTRA (VALDIVIA)
+  42075, -33.45700195645673, -70.59063381166781, # JARDIN INFANTIL Y SALA CUNA APAPACHO (NUNOA)
+  42077, -33.47476199832859, -70.5468577555261, # JARDIN INFANTIL PEHUEN (PENALOLEN)
+  42082, -36.757594094022416, -73.09580230754904, # ESCUELA DE LENGUAJE PASO A PASO (TALCAHUANO)
+  42083, -22.444835802522913, -68.92370714829939, # JARDIN INFANTIL Y SALA CUNA HERABUNTUR (CALAMA)
+  42084, -33.43792955988487, -70.54476580981832, # JARDIN INFANTIL GIRAMUNDOS (LA REINA)
+  42085, -33.057306913907624, -71.5871848828827, # SALA CUNA Y JARDIN INFANTIL POLYKAY (VALPARAISO)
+  42086, -22.45381599503503, -68.91790732185395, # JARDIN INFANTIL Y SALA CUNA GABRIELA MISTRAL (CALAMA)
+  42087, -33.44312448106152, -70.60249719262461, # JARDIN INFANTIL Y SALA CUNA PEQUENOS TALENTOS (PROVIDENCIA)
+  42088, -33.595854626520335, -71.60954894742015, # JARDIN INFANTIL Y SALA CUNA MI PEQUENO ARCOIRIS (SAN ANTONIO)
+  42095, -22.083676857305445, -70.18533372530642, # JARDIN INFANTIL ESTRELLITAS DEL PACIFICO (TOCOPILLA)
+  42098, -33.375087759332395, -70.50926423865668, # JARDIN INFANTIL PALIBU (LAS CONDES)
+  42099, -33.50409744998678, -70.61293937440882, # SALA CUNA Y JARDIN INFANTIL NUEVO MUNDO (MACUL)
+  42103, -33.562599671901935, -70.54721407488583, # JARDIN INFANTIL Y SALA CUNA ESTRELLITA DE MAR (PUENTE ALTO)
+  42107, -36.61115798335433, -72.11748223011138, # ESCUELA HOSPITALARIA UNIVERSIDAD DEL BIO-BIO (CHILLAN)
+  42113, -33.507862697047436, -70.69372595637898, # JARDIN INFANTIL PEQUENOS GIGANTES (SANTIAGO)
+  42114, -35.468255207762155, -71.66715181441576, # ESCUELA DE LENGUAJE ACUARELA (MAULE)
+  42120, -33.45493360937416, -70.70766472145993, # JARDIN INFANTIL MY LITTLE HOME (LO PRADO)
+  42121, -33.4791769393731, -70.54550557440987, # JARDIN INFANTIL DONDE TERMINA EL ARCOIRIS (PENALOLEN)
+  42132, -34.73336227544911, -71.26804228650728, # SALA CUNA CARINOSITOS (CHEPICA)
+  42133, -33.458371456901446, -70.59585950557641, # SALA CUNA Y JARDIN INFANTIL TIA BEA (NUNOA)
+  42134, -23.65225834756206, -70.40205450912956, # JARDIN INFANTIL CONEJO TAMBOR (ANTOFAGASTA)
+  42135, -23.58210254740533, -70.39066194510501, # JARDIN INFANTIL HAPPY HOUSE (ANTOFAGASTA)
+  42137, -33.45927901266826, -70.72404658420263, # JARDIN INFANTIL Y SALA CUNA DULCE AVENTURA (ESTACION CENTRAL)
+  42141, -33.41740038082259, -70.57496373680455, # SALA CUNA Y JARDIN INFANTIL CASA KUTUTU (LAS CONDES)
+  42144, -34.40791116314038, -71.29801968818033, # JARDIN INFANTIL Y SALA CUNA FRUTITOS DEL CAMPO (PICHIDEGUA)
+  42164, -29.960918292784065, -71.34289987638306, # SALA CUNA ENTRETENIDAMENTE KIDS (COQUIMBO)
+  42165, -23.562303258048587, -70.39265398821706, # JARDIN INFANTIL Y SALA CUNA MAPUNUKE (ANTOFAGASTA)
+  42167, -33.587480960095675, -70.58196076091313, # CENTRO DE APOYO PEDAGOGICO E INTEGRAL SAN ALFONSO (PUENTE ALTO)
+  42171, -33.59260094875182, -70.7081312161365, # JARDIN INFANTIL ANELEY MONTESSORI (SAN BERNARDO)
+  42175, -33.3974132005808, -70.56185967626313, # JARDIN INFANTIL KIDDY NEST PRESCHOOL (LAS CONDES)
+  42177, -23.23587085607031, -70.35721442491543, # PARVADITA DE COLORES (ANTOFAGASTA)
+  42178, -33.67487294632845, -71.59975198837373, # COLEGIO AGUSTIN DE HIPONA (SANTO DOMINGO)
+  42180, -36.77285732720306, -73.07621895073437, # SALA CUNA Y JARDIN INFANTIL GREEN GARDEN ECOLOGY 2 (CONCEPCION)
+  42182, -33.27268948280031, -70.63135291907683, # SALA CUNA Y JARDIN INFANTIL COUNTRYSIDE PRESCHOOL (COLINA)
+  42183, -33.378939386781816, -70.5231927442074, # SALA CUNA Y JARDIN INFANTIL MUNAY MONTESSORI (LAS CONDES)
+  42184, -33.38517522259093, -70.53538043256496, # SALA CUNA Y JARDIN INFANTIL EL BOSQUE DE LOS ENANITOS (LAS CONDES)
+  42186, -33.04535998707581, -71.61764032702808, # SALA CUNA Y JARDIN INFANTIL CAJA MAGICA (VALPARAISO)
+  42187, -32.754373377893955, -70.71111846142689, # JARDIN INFANTIL MINI SPARKLES (SAN FELIPE)
+  42192, -34.17509333772311, -70.73511102883575, # REVISAR: la coordenada cae en Rancagua y la comuna es LA REINA | JARDIN INFANTIL Y SALA CUNA GARDEN KIDS (LA REINA)
+  42193, -33.38032548373148, -70.57394853256513, # JARDIN INFANTIL RONDA (VITACURA)
+  42195, -33.4913390131855, -70.64850371536694, # SALA CUNA Y JARDIN INFANTIL ARBOLITO (SAN MIGUEL)
+  42196, -33.292781033553524, -70.87305023071848, # SALA CUNA QUITRAL MONTESSORI (LAMPA)
+  42197, -33.3954832810311, -70.5534789883856, # SALA CUNA NIDO ALEXANDER MONTESSORI (LAS CONDES)
+  42200, -38.67409622723423, -73.136281608352, # PAPELUCHO (CARAHUE)
+  42202, -39.85036848781204, -73.24961137600728, # ALTO GUACAMAYO (VALDIVIA)
+  42205, -33.44299906993639, -70.62884142883576, # SALA CUNA Y JARDIN INFANTIL THE HAPPY HOUSE (PROVIDENCIA)
+  42209, -33.02932952756944, -71.52991807738553, # SALA CUNA Y JARDIN INFANTIL QUEST EARLY LEARNING CENTER (VINA DEL MAR)
+  42212, -33.568895744563456, -70.79878375582118, # ESCUELA ESPECIAL DE LENGUAJE ALIHUEN (PADRE HURTADO)
+  42215, -53.16059386536377, -70.8967935800777, # ESPACIO EDUCATIVO CONECTARTE (PUNTA ARENAS)
+  42219, -33.43945583894269, -70.54866749077446, # SALA CUNA Y JARDIN INFANTIL REFUGIO DE COLORES (LA REINA)
+  42220, -41.32086379848137, -72.9823412057517, # JARDIN INFANTIL EUREKA (PUERTO VARAS)
+  42222, -34.402646068574214, -71.36624335634656, # JARDIN INFANTIL Y SALA CUNA RAYITO DE SOL (PICHIDEGUA)
+  42230, -33.43631936966776, -70.599389648732, # SALA CUNA Y JARDIN INFANTIL TARUCA PORTAL (PROVIDENCIA)
+  42234, -39.27500077087378, -71.96915425884984, # ESCUELA ESPECIAL INCLUSIVA LIWEN (PUCON)
+  42236, -34.29280547097064, -71.0806306897227, # SALA CUNA Y JARDIN INFANTIL PAYASITO (COLTAUCO)
+  42237, -34.17570522149373, -70.70883150376024, # JARDIN INFANTIL SAINT PATRICK (RANCAGUA)
+  42239, -33.437739602042285, -70.58206705954811, # SALA CUNA Y JARDIN INFANTIL AMUN (NUNOA)
+  42240, -33.524691115913136, -70.57757986193504, # SALA CUNA Y JARDIN INFANTIL CASCANUECES (LA FLORIDA)
+  42244, -33.56286781286777, -70.5602084762571, # SALA CUNA MI SOL (PUENTE ALTO)
+  42249, -33.5111716550676, -70.75500766091592, # JARDIN INFANTIL PEQUENO TALLER (MAIPU)
+  42251, -22.456592431810247, -68.9255020258413, # JARDIN INFANTIL EL CASTILLO MAGICO (CALAMA)
+  42252, -33.44988274470144, -70.57571727674093, # SALA CUNA Y JARDIN INFANTIL UPITA (NUNOA)
+  42257, -39.20209466136828, -72.2004715892063, # LOS DUENDECITOS (VILLARRICA)
+  42258, -28.58340687866367, -70.74382853224904, # JARDIN INFANTIL Y SALA CUNA MOSAICO MONTESSORI (VALLENAR)
+  42260, -33.43353939523494, -70.7213467985111, # JARDIN INFANTIL PEQUENOS TOQUIS (CERRO NAVIA)
+  42261, -27.37025042078367, -70.33085951190347, # COLEGIO SAN PATRICIO ATACAMA (COPIAPO)
+  42264, -23.636799848815553, -70.39532174773682, # DAGIS TALITA CUMI (ANTOFAGASTA)
+  42267, -43.183008965111355, -71.86918764775126, # SALA CUNA Y JARDIN INFANTIL FUTALEUFU (PALENA)
+  42268, -33.44983738264646, -70.57561331942192, # SALA CUNA Y JARDIN INFANTIL UPITA (NUNOA)
+  42270, -38.734634212232606, -72.61229895886092, # JARDIN INFANTIL COCOLICHE (TEMUCO)
+  42271, -33.45190394488638, -70.60830149262434, # SALA CUNA Y JARDIN INFANTIL VOVO BEBA (NUNOA)
+  42274, -33.48731842999709, -70.65298123211922, # SALA CUNA Y JARDIN INFANTIL LOS ENANITOS (SAN MIGUEL)
+  42275, -34.57633528188844, -70.9929674008274, # BAMBI (SAN FERNANDO)
+  42276, -33.59951462621865, -70.5722446485793, # SALA CUNA Y JARDIN INFANTIL EL MUNDO DE LOS NINOS (PUENTE ALTO)
+  42277, -33.35918406322723, -70.53286262154059, # JARDIN INFANTIL RAINBOW (LO BARNECHEA)
+  42278, -30.60918956327724, -71.21056616020321, # JARDIN INFANTIL BARUJ (OVALLE)
+  42279, -33.59989237238845, -70.6925304397585, # SALA CUNA BABY CARACOLA (SAN BERNARDO)
+  42283, -32.94568152127899, -71.5409235325833, # JARDIN INFANTIL JOURNEY PLAY & STUDY (CONCON)
+  42284, -33.58934815714053, -70.60225628896126, # SOR TERESA (PUENTE ALTO)
+  42285, -34.35589142833684, -71.73496489814966  # SALA CUNA Y JARDIN INFANTIL FRUTILLITAS (MARCHIHUE)
+)
+
+aplicar_coord_manual <- function(ee, tabla = coord_manual) {
+
+  # --- Chequeos de la tabla ---------------------------------------------------
+  stopifnot(
+    !anyDuplicated(tabla$RBD),
+    all(tabla$LATITUD  < -17 & tabla$LATITUD  > -56),   # Chile continental
+    all(tabla$LONGITUD < -66 & tabla$LONGITUD > -76)
+  )
+
+  # --- Chequeos de ee ---------------------------------------------------------
+  stopifnot(
+    all(c("RBD", "LATITUD", "LONGITUD") %in% names(ee)),
+    is.numeric(ee$LATITUD), is.numeric(ee$LONGITUD)     # aplicar despues de arreglar_coord()
+  )
+
+  idx    <- match(ee$RBD, tabla$RBD)
+  tiene  <- !is.na(idx)
+  faltan <- setdiff(tabla$RBD, ee$RBD)
+  previas <- tiene & !is.na(ee$LATITUD) & !is.na(ee$LONGITUD)
+
+  if (length(faltan) > 0) {
+    warning("RBD de la tabla que no estan en ee (", length(faltan), "): ",
+            paste(faltan, collapse = ", "),
+            ". Revisar si tienen ESTADO_ESTAB distinto de 1 o si el RBD esta mal escrito.")
+  }
+
+  # --- Asignacion -------------------------------------------------------------
+  ee$LATITUD[tiene]  <- tabla$LATITUD[idx[tiene]]
+  ee$LONGITUD[tiene] <- tabla$LONGITUD[idx[tiene]]
+  ee$coord_manual    <- tiene
+
+  message("Coordenadas manuales asignadas: ", sum(tiene), " de ", nrow(tabla),
+          " en la tabla. Reemplazaron una coordenada previa no perdida: ", sum(previas), ".")
+
+  ee
+}
+
+
+ee <- aplicar_coord_manual(ee)
+
+ee <- ee %>% filter(!is.na(LATITUD), !is.na(LONGITUD),
+         LATITUD  < -17, LATITUD  > -91,      # rango plausible para Chile
+         LONGITUD < -66, LONGITUD > -110,
+         LATITUD!=LONGITUD)
+
+
+nrow(ee) # 12026
+summary(ee[, c("LATITUD", "LONGITUD")])
+
+
+
+```
+
+# 4. Cruce espacial escuela-sector
+
+Cada escuela (punto) se cruza por separado con zonas y con localidades. En una muestra de zonas, el solape con localidades fue prácticamente nulo (máximo 2e-5 del área), así que una escuela cae en una sola unidad. `st_intersects` + `distinct(.fila)` evita duplicar escuelas que caen justo sobre un borde. Si la escuela cae en una zona se anula el ID de localidad.
+
+```{r cruce}
+escuelas_sf <- ee %>%
+  st_as_sf(coords = c("LONGITUD", "LATITUD"), crs = 4326, remove = FALSE) %>%
+  mutate(.fila = row_number())
+
+### Cruce zona
+cruce_zona <- escuelas_sf %>%
+  select(.fila) %>%
+  st_join(zonas_v %>% select(ID_ZONA), join = st_intersects) %>%
+  st_drop_geometry() %>%
+  distinct(.fila, .keep_all = TRUE)
+
+### Cruce localidad
+cruce_loc <- escuelas_sf %>%
+  select(.fila) %>%
+  st_join(loc_v %>% select(ID_LOCALIDAD), join = st_intersects) %>%
+  st_drop_geometry() %>%
+  distinct(.fila, .keep_all = TRUE)
+
+######
+escuelas_ids <- escuelas_sf %>%
+  left_join(cruce_zona %>% select(.fila, ID_ZONA),      by = ".fila") %>%
+  left_join(cruce_loc  %>% select(.fila, ID_LOCALIDAD), by = ".fila") %>%
+  mutate(
+    tipo_unidad = case_when(
+      !is.na(ID_ZONA)      ~ "zona",
+      !is.na(ID_LOCALIDAD) ~ "localidad",
+      TRUE                 ~ NA_character_
+    ),
+    # si cae en zona, se anula el ID de localidad
+    ID_LOCALIDAD = replace(ID_LOCALIDAD, tipo_unidad %in% "zona", NA)
+  ) %>%
+  select(-.fila)
+
+# NOTA: Resultados esperados de los tres chequeos: mismo N antes y después del cruce,
+#   conteo por tipo_unidad, y cero escuelas con ID_ZONA e ID_LOCALIDAD a la vez.
+### Chequeo
+nrow(escuelas_sf); nrow(escuelas_ids)      # deben ser iguales 11850
+table(escuelas_ids$tipo_unidad, useNA = "ifany") # dos NA
+sum(!is.na(escuelas_ids$ID_ZONA) & !is.na(escuelas_ids$ID_LOCALIDAD))   # debe dar 0
+
+
+```
+
+# 5. Escuelas sin sector
+
+Dos escuelas quedaron a menos de 1 km de una zona (borde costero) y se asignan a la más cercana. La columna `asignada_cercana` marca los casos asignados por cercanía.
+
+```{r sin_sector}
+# Asignamos sector mas cercano en 3 escuelas que no tenían asignado sector
+### Asignar unidad mas cercana a escuelas sin cruce (solo si esta a menos de 1000 m)
+zl <- bind_rows(
+  zonas_v %>% transmute(tipo = "zona",      ID = as.character(ID_ZONA)),
+  loc_v   %>% transmute(tipo = "localidad", ID = as.character(ID_LOCALIDAD))
+)
+
+sin <- which(is.na(escuelas_ids$tipo_unidad))
+# REVISAR: El nombre idx se reutiliza más abajo para otra cosa (límite urbano). Con
+#   nombres distintos (por ejemplo idx_sin e idx_lim) se evitan errores si se corren
+#   chunks fuera de orden (sugerencia 9).
+idx <- st_nearest_feature(escuelas_ids[sin, ], zl)
+d   <- as.numeric(st_distance(escuelas_ids[sin, ], zl[idx, ], by_element = TRUE))
+# NOTA: Umbral de 1000 m: decisión metodológica. Solo se asigna la unidad más cercana si
+#   está a menos de 1 km.
+ok  <- d < 1000
+
+i_z <- sin[ok & zl$tipo[idx] == "zona"]
+i_l <- sin[ok & zl$tipo[idx] == "localidad"]
+
+escuelas_ids$ID_ZONA[i_z]       <- as(zl$ID[idx][ok & zl$tipo[idx] == "zona"],
+                                      class(escuelas_ids$ID_ZONA)[1])
+escuelas_ids$ID_LOCALIDAD[i_l]  <- as(zl$ID[idx][ok & zl$tipo[idx] == "localidad"],
+                                      class(escuelas_ids$ID_LOCALIDAD)[1])
+escuelas_ids$tipo_unidad[i_z]   <- "zona"
+escuelas_ids$tipo_unidad[i_l]   <- "localidad"
+
+# marca para saber cuales se asignaron por cercania
+escuelas_ids$asignada_cercana <- seq_len(nrow(escuelas_ids)) %in% c(i_z, i_l)
+
+
+
+
+```
+
+# 6. Área y densidad de los sectores
+
+`SHAPE_Area` de las capas viene en grados cuadrados (el cociente con el área en m² es ~1e10 y varía con la latitud), por eso no se usa. El área se calcula con una proyección equivalente de Albers para todo Chile. La densidad queda en personas por km².
+
+```{r densidad}
+### Area y densidad de zonas y localidades
+# SHAPE_Area viene en grados^2 (cociente ~1e10 con el area en m2); se calcula el area
+# con proyeccion equivalente (Albers, crs_aea) para tener m2 comparables en todo el pais
+
+crs_aea <- "+proj=aea +lat_1=-18 +lat_2=-54 +lat_0=-36 +lon_0=-72 +datum=WGS84 +units=m +no_defs"
+
+calc_dens <- function(capa, id) {
+  x <- capa[, c(id, "n_per")]                      # solo ID, n_per y geometria
+  x <- st_transform(x, crs_aea)                    # proyeccion que conserva areas
+  x$area_m2 <- as.numeric(st_area(st_geometry(x)))
+  x <- st_drop_geometry(x)
+  x$n_per <- as.numeric(x$n_per)
+
+  x %>%
+    group_by(across(all_of(id))) %>%               # por si un ID tiene varios poligonos
+    summarise(area_m2 = sum(area_m2),
+              n_per   = first(n_per),              # n_per es del sector, no se suma
+              .groups = "drop") %>%
+    mutate(dens_km2 = n_per / area_m2 * 1e6)
+}
+
+# NOTA: En calc_dens() n_per se toma con first() porque es el total del sector y se
+#   repite si el sector tiene varios polígonos; sumarlo lo inflaría. Aquí verificamos que n_per
+#   sea constante por ID antes de confiar en first().
+chk_nper <- function(capa, id) {
+  capa %>%
+    st_drop_geometry() %>%
+    group_by(across(all_of(id))) %>%
+    summarise(n_poligonos    = n(),
+              n_valores_nper = n_distinct(n_per),
+              .groups = "drop")
+}
+
+chk_zona <- chk_nper(zonas_v, "ID_ZONA")
+chk_loc  <- chk_nper(loc_v,   "ID_LOCALIDAD")
+
+# 1) Hay IDs repartidos en mas de un poligono?
+table(chk_zona$n_poligonos > 1)
+table(chk_loc$n_poligonos  > 1)
+
+# 2) Entre esos, el n_per cambia entre poligonos? (debe dar 0 filas)
+chk_zona %>% filter(n_valores_nper > 1)
+chk_loc  %>% filter(n_valores_nper > 1)
+
+# 3) IDs o n_per perdidos
+sum(is.na(zonas_v$ID_ZONA));  sum(is.na(zonas_v$n_per))
+sum(is.na(loc_v$ID_LOCALIDAD)); sum(is.na(loc_v$n_per))
+
+# Calculo de densidades
+dens_zona <- calc_dens(zonas_v, "ID_ZONA")
+dens_loc  <- calc_dens(loc_v,   "ID_LOCALIDAD")
+
+
+```
+
+# 7. Distancia al límite urbano
+
+Distancia de cada escuela al límite urbano más cercano, en metros. Dentro del límite la distancia es 0.
+
+```{r distancia}
+### Distancia a limite urbano
+# Distancia geodesica (en metros) al limite urbano mas cercano
+# NOTA: Con s2 activo, st_distance() entrega distancia geodésica en metros y no depende
+#   de la proyección.
+sf_use_s2(TRUE)
+idx <- st_nearest_feature(escuelas_ids, limite_v)
+
+escuelas_ids$dist_limite_m <- as.numeric(
+  st_distance(escuelas_ids, limite_v[idx, ], by_element = TRUE)
+)
+escuelas_ids$dentro_limite <- escuelas_ids$dist_limite_m == 0
+escuelas_ids$limite_cercano <- limite_v$LOCALIDAD[idx]    # nombre de la entidad urbana mas cercana
+
+summary(escuelas_ids$dist_limite_m)
+table(escuelas_ids$dentro_limite)
+
+
+
+```
+
+## 7.1 Chequeo contra RURAL_RBD
+
+`RURAL_RBD` indica escuelas a más de 5 km de un límite urbano. Esta tabla compara esa clasificación con la distancia calculada aquí.
+
+```{r chequeo_rural}
+#chequeo rural RBD
+table(RURAL_RBD = escuelas_ids$RURAL_RBD, mas_de_5km = escuelas_ids$dist_limite_m > 5000)
+escuelas_ids %>% st_drop_geometry() %>%
+  group_by(RURAL_RBD) %>%
+  summarise(n = n(), mediana_m = median(dist_limite_m), p90_m = quantile(dist_limite_m, .9))
+
+
+```
+
+# 8. Densidad en la base de escuelas
+
+Se pega a cada escuela la densidad de su zona o localidad. `coalesce` toma la de la zona si existe y, si no, la de la localidad.
+
+```{r pegar_densidad}
+### Pegar a las escuelas
+
+escuelas_dens <- escuelas_ids %>%
+  left_join(dens_zona %>% rename(area_m2_z = area_m2, n_per_z = n_per, dens_z = dens_km2),
+            by = "ID_ZONA") %>%
+  left_join(dens_loc %>% rename(area_m2_l = area_m2, n_per_l = n_per, dens_l = dens_km2),
+            by = "ID_LOCALIDAD") %>%
+  mutate(
+    area_sector_m2  = coalesce(area_m2_z, area_m2_l),
+    n_per_sector    = coalesce(n_per_z, n_per_l),
+    dens_sector_km2 = coalesce(dens_z, dens_l)
+  ) %>%
+  select(-area_m2_z, -area_m2_l, -n_per_z, -n_per_l, -dens_z, -dens_l)
+
+```
+
+## 8.1 Chequeos
+
+```{r chequeos_densidad}
+### Chequeos
+nrow(escuelas_ids); nrow(escuelas_dens)            # deben ser iguales
+summary(escuelas_dens$dens_sector_km2)
+sum(is.na(escuelas_dens$dens_sector_km2))          # escuelas sin densidad
+escuelas_dens %>%
+  st_drop_geometry() %>%
+  group_by(tipo_unidad) %>%
+  summarise(n = n(),
+            mediana_dens = median(dens_sector_km2, na.rm = TRUE),
+            mediana_area_km2 = median(area_sector_m2, na.rm = TRUE) / 1e6)
+
+
+```
+
+# 9. Validación: comuna del directorio vs comuna de la cartografía
+
+Si la escuela quedó bien ubicada, la comuna del directorio debería coincidir con la comuna del sector donde cayó. La coincidencia fue alta; las discrepancias son candidatas a coordenadas mal ubicadas.
+
+```{r validacion_comuna}
+## Chequeo de que en la mayoría de los casos coincida comuna del directorio con comuna del censo
+
+norm <- function(x) toupper(iconv(trimws(x), to = "ASCII//TRANSLIT"))
+
+revision <- escuelas_ids %>%
+  st_drop_geometry() %>%
+  left_join(zonas_v %>% st_drop_geometry() %>% select(ID_ZONA, COM_Z = COMUNA), by = "ID_ZONA") %>%
+  left_join(loc_v %>% st_drop_geometry() %>% select(ID_LOCALIDAD, COM_L = COMUNA), by = "ID_LOCALIDAD") %>%
+  mutate(COM_CART = coalesce(COM_Z, COM_L),
+         coincide = norm(NOM_COM_RBD) == norm(COM_CART))
+
+mean(revision$coincide, na.rm = TRUE)
+revision %>% filter(!coincide) %>% select(RBD, NOM_RBD, NOM_COM_RBD, COM_CART) %>% head(30)
+#Resultados muestran que está bien la coincidencia
+
+
+```
+
+# 10. Guardar
+
+```{r guardar}
+#Agregamos transformación logaritmica para densidad y distancia
+escuelas_dens$log_dist_limite_m<- log(escuelas_dens$dist_limite_m+1)
+escuelas_dens$log_dens_sector_km2<- log(escuelas_dens$dens_sector_km2+1)
+  
+### Guardar (sin geometria)
+
+escuelas_dens %>%
+  st_drop_geometry() %>%
+  write.csv2(
+    file = paste0(path_in,"/Base de datos/escuelas_con_longitud_latitud_completadas_ID.csv"),
+    row.names = FALSE
+  )
+
+```
+

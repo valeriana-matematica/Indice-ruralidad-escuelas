@@ -1,0 +1,264 @@
+---
+title: "B1_Limpieza_de_datos"
+author: "VGiaconi"
+date: "2025-03-20"
+output:
+  html_document: default
+  word_document: default
+---
+
+# Resumen del script
+
+**Qué hace:** toma la base censal por zona y localidad, crea variables derivadas, calcula los porcentajes que alimentan el índice y los une a la base de escuelas.
+
+**Entradas:** `Base_zona_localidad_CPV24.csv` (censo) y `escuelas_con_longitud_latitud_completadas_ID.csv` (salida de B0).
+
+**Salida:** `escuelas_con_longitud_latitud_completadas_IDok.csv`, una fila por escuela con las variables censales de su sector. Es la entrada del script A1.
+
+**Orden de la serie:** B0 (geografía) → B1 (variables censales por sector) → A1 (índice de ruralidad).
+
+**Comentarios dentro de los chunks:** `# NOTA:` explica; 
+
+# 1. Paquetes, rutas y lectura de datos
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+path_in <- "RUTA/A/TU/CARPETA/Proyecto Indice de Ruralidad de Escuelas/"
+
+#datos censo y escuelas
+censo_zona_localidad<-read.csv2(paste(path_in,"Base de datos/Bases Censo Distrito 2024/Base_zona_localidad_CPV24.csv",sep=""))
+ee<-read.csv2(paste(path_in,"Base de datos/escuelas_con_longitud_latitud_completadas_ID.csv",sep=""))
+
+```
+
+# 2. Identificador de sector
+
+Cada fila del censo es una zona (urbana) o una localidad (rural). Se arma un identificador `ID` con la zona primero y la localidad después, y un `ID_UNIDAD` con prefijo para distinguir el tipo.
+
+```{r id_sector, include=FALSE}
+# REVISAR: ID mezcla códigos de zona y de localidad en una sola columna. ID_UNIDAD (con
+#   prefijo Z_ o L_) se crea aquí pero después no se usa: la agregación y la unión con
+#   las escuelas se hacen por ID. Si algún código de zona coincidiera con uno de
+#   localidad, se fusionarían dos sectores distintos sin aviso. Chequear colisiones y,
+#   si las hay, unir por ID_UNIDAD (sugerencia 1).
+censo_zona_localidad <- censo_zona_localidad %>%
+  mutate(
+    ID = coalesce(ID_ZONA, ID_LOCALIDAD),
+    tipo_unidad = case_when(
+      !is.na(ID_ZONA)      ~ "zona",
+      !is.na(ID_LOCALIDAD) ~ "localidad"
+    ),
+    ID_UNIDAD = case_when(
+      !is.na(ID_ZONA)      ~ paste0("Z_", ID_ZONA),
+      !is.na(ID_LOCALIDAD) ~ paste0("L_", ID_LOCALIDAD)
+    )
+  )
+
+#chequeo de que ID es único.
+censo_zona_localidad %>% group_by(ID) %>%
+  summarise(n = n(), n_tipos = n_distinct(tipo_unidad)) %>%
+  filter(n > 1 | n_tipos > 1)     # debe dar 0 filas
+```
+
+# 3. Variables a mantener y a sumar
+
+`var_mantener` son identificadores que se conservan; `var_sumar` son los conteos que se agregan por sector.
+
+```{r variables}
+#Primer procesamiento de variables a mantener y variables a sumar por distrito
+var_mantener <- c(
+  "REGION",
+  "PROVINCIA",
+  "CUT",
+  "COMUNA",
+  "AREA_C")
+
+var_sumar <- c(
+  "n_per",
+  "n_ocupado",
+  "n_desocupado",
+  "n_fuera_fuerza_trabajo",
+  "n_cise_rec_independientes",
+  "n_cise_rec_dependientes",
+  "n_cise_rec_trabajador_no_remunerado",
+  "n_ciuo_6",
+  "n_ciuo_7",
+  "n_caenes_A",
+  "n_caenes_B",
+  "n_caenes_I",
+  "n_hog",
+  "n_comb_cocina_gas",
+  "n_comb_cocina_parafina",
+  "n_comb_cocina_lena",
+  "n_comb_cocina_pellet",
+  "n_comb_cocina_carbon",
+  "n_comb_cocina_electricidad",
+  "n_comb_cocina_solar",
+  "n_comb_cocina_no_utiliza",
+  "n_comb_calefaccion_gas",
+  "n_comb_calefaccion_parafina",
+  "n_comb_calefaccion_lena",
+  "n_comb_calefaccion_pellet",
+  "n_comb_calefaccion_carbon",
+  "n_comb_calefaccion_electricidad",
+  "n_comb_calefaccion_otra",
+  "n_comb_calefaccion_no_utiliza",
+  "n_serv_tel_movil",
+  "n_serv_compu",
+  "n_serv_tablet",
+  "n_serv_internet_fija",
+  "n_serv_internet_movil",
+  "n_serv_internet_satelital",
+  "n_internet",
+  "n_mat_paredes_hormigon",
+  "n_mat_paredes_albanileria",
+  "n_mat_paredes_tabique_forrado",
+  "n_mat_paredes_tabique_sin_forro",
+  "n_mat_paredes_artesanal",
+  "n_mat_paredes_precarios",
+  "n_mat_techo_tejas",
+  "n_mat_techo_hormigon",
+  "n_mat_techo_zinc",
+  "n_mat_techo_fibrocemento",
+  "n_mat_techo_fonolita",
+  "n_mat_techo_paja",
+  "n_mat_techo_precarios",
+  "n_mat_techo_sin_cubierta",
+  "n_mat_piso_radier_con_revestimiento",
+  "n_mat_piso_radier_sin_revestimiento",
+  "n_mat_piso_baldosa_cemento",
+  "n_mat_piso_capa_cemento",
+  "n_mat_piso_tierra",
+  "n_fuente_agua_publica",
+  "n_fuente_agua_pozo",
+  "n_fuente_agua_camion",
+  "n_fuente_agua_rio",
+  "n_distrib_agua_llave",
+  "n_distrib_agua_llave_fuera",
+  "n_distrib_agua_acarreo",
+  "n_serv_hig_alc_dentro",
+  "n_serv_hig_alc_fuera",
+  "n_serv_hig_fosa",
+  "n_serv_hig_pozo",
+  "n_serv_hig_acequia_canal",
+  "n_serv_hig_cajon_otro",
+  "n_serv_hig_bano_quimico",
+  "n_serv_hig_bano_seco",
+  "n_serv_hig_no_tiene",
+  "n_fuente_elect_publica",
+  "n_fuente_elect_diesel",
+  "n_fuente_elect_solar",
+  "n_fuente_elect_eolica",
+  "n_fuente_elect_otro",
+  "n_fuente_elect_no_tiene",
+  "n_basura_servicios",
+  "n_basura_entierra",
+  "n_basura_eriazo",
+  "n_basura_rio",
+  "n_basura_otro",
+  "n_serv_hig_alcantarillado_nuevavar",  
+  "n_comb_cocina_lenaymas_nuevavar",     
+  "n_comb_calefaccion_lenaymas_nuevavar"
+)
+```
+
+# 4. Variables derivadas
+
+Algunas categorías se combinan en una sola variable (alcantarillado dentro y fuera de la vivienda; leña, pellet y carbón). Estas variables nuevas llevan el sufijo `_nuevavar`.
+
+```{r derivadas}
+#Variables que requieren breve ajuste para contar combinación de categorías.
+censo_zona_localidad$n_serv_hig_alcantarillado_nuevavar<- censo_zona_localidad$n_serv_hig_alc_dentro+censo_zona_localidad$n_serv_hig_alc_fuera
+
+censo_zona_localidad$n_comb_cocina_lenaymas_nuevavar<- censo_zona_localidad$n_comb_cocina_lena + censo_zona_localidad$n_comb_cocina_pellet + censo_zona_localidad$n_comb_cocina_carbon
+
+censo_zona_localidad$n_comb_calefaccion_lenaymas_nuevavar<-censo_zona_localidad$n_comb_calefaccion_lena + censo_zona_localidad$n_comb_calefaccion_pellet + censo_zona_localidad$n_comb_calefaccion_carbon
+
+#cambio a numerico, valores con * se consideran perdidos. evaluar si en los promedios imputamos por el valor comunal
+censo_zona_localidad <- censo_zona_localidad %>%
+  mutate(across(all_of(var_sumar), as.numeric))
+
+```
+
+
+## 4.1 Conversión a numérico y agregación por sector
+
+Los valores con `*` (reserva estadística del INE) pasan a `NA` al convertir. La agregación usa `na.rm = FALSE`, así que un componente perdido deja el total perdido; es coherente con tratar `*` como dato perdido y con el uso de FIML en el CFA.
+
+# 5. Variables del índice: porcentajes
+
+Cada conteo se divide por su denominador (personas u hogares) y se multiplica por 100.
+
+## 5.1 Porcentajes sobre personas
+
+```{r pct_personas}
+####### Variables que represental al porcentaje de personas ocupadas en el sector que cumple una condición
+
+vars_porcentaje_personas<-c("n_ciuo_6","n_caenes_A")
+
+censo_sector <- censo_zona_localidad %>%
+  mutate(across(
+    all_of(vars_porcentaje_personas),
+    ~ ifelse(n_ocupado > 0, (.x / n_ocupado) * 100, NA_real_),
+    .names = "pct_{.col}"
+  ))  
+
+censo_sector <- censo_sector %>%
+  select(ID, all_of(var_mantener), all_of(var_sumar), starts_with("pct_"))
+
+```
+
+## 5.2 Porcentajes sobre hogares
+
+```{r pct_hogares}
+####### Variables que represental al porcentaje de hogares del sector que cumplen una condición
+# NOTA: Denominador n_hog, correcto para indicadores de hogar. 
+
+vars_porcentaje_hogares<-c("n_fuente_agua_publica","n_fuente_agua_pozo","n_fuente_agua_camion","n_fuente_agua_rio","n_fuente_elect_publica","n_basura_servicios","n_serv_internet_fija","n_serv_internet_movil","n_serv_internet_satelital","n_serv_hig_alcantarillado_nuevavar","n_comb_cocina_lenaymas_nuevavar","n_comb_calefaccion_lenaymas_nuevavar")
+censo_sector <- censo_sector %>%
+  mutate(across(
+    all_of(vars_porcentaje_hogares),
+    ~ ifelse(n_hog > 0, (.x / n_hog) * 100, NA_real_),
+    .names = "pct_{.col}"
+  ))  
+  
+  
+#vars que no requieren transformación  
+#AREA_C
+  
+
+```
+
+
+# 6. Unión con la base de escuelas y guardado
+
+Cada escuela recibe las variables de su sector. La unión usa el mismo criterio de ID que el censo (zona primero, luego localidad).
+
+```{r union}
+#merge de datos de escuelas con datos censales
+# NOTA: En B0 ID_LOCALIDAD ya se anuló para escuelas en zona, así que coalesce()
+#   reproduce el criterio del censo.
+ee <- ee %>%
+  mutate(ID = coalesce(ID_ZONA, ID_LOCALIDAD))
+
+escuelas_ok<-merge(ee,censo_sector,by=c("ID"),all.x=TRUE,all.y=FALSE)
+sum(is.na(escuelas_ok$n_per))
+
+
+# Por si hay casos de latitud duplicada con la longitud
+nrow(escuelas_ok)
+escuelas_ok %>% filter(LATITUD == LONGITUD) %>% select(RBD, NOM_RBD, NOM_COM_RBD, LATITUD, LONGITUD)
+nrow(escuelas_ok)
+escuelas_ok <- escuelas_ok %>% filter(LATITUD != LONGITUD) 
+
+write.csv2(escuelas_ok, file=paste0(path_in,"Base de datos/escuelas_con_longitud_latitud_completadas_IDok.csv"),row.names = FALSE)
+
+
+
+
+```
+
+

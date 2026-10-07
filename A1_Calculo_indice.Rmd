@@ -1,0 +1,150 @@
+---
+title: "A1_Calculo_indice"
+author: "VGiaconi"
+date: "2025-03-20"
+output:
+  html_document: default
+  word_document: default
+---
+
+# Resumen del script
+
+**Qué hace:** ajusta un modelo factorial confirmatorio de un factor (CFA) y calcula el puntaje de ruralidad de cada escuela.
+
+**Entrada:** `escuelas_con_longitud_latitud_completadas_IDok.csv` (salida de B1).
+
+**Salida:** `indice_ruralidad_escuelas.csv` e `indice_ruralidad_escuelas.xlsm` con el puntaje por escuela (continuo, 0 a 100 y quintiles).
+
+**Orden de la serie:** 0 (geografía) → B1 (variables censales por sector) → A0 (descriptivos) → A1 (índice de ruralidad).
+
+**Comentarios dentro de los chunks:** `# NOTA:` explica
+
+# 1. Lectura y preparación de datos
+
+```{r setup}
+library(lavaan)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(GGally)
+library(writexl)
+
+path_in <-  "RUTA/A/TU/CARPETA/Proyecto Indice de Ruralidad de Escuelas/"
+
+#datos escuelas
+dat_schools<-read.csv2(paste(path_in,"Base de datos/escuelas_con_longitud_latitud_completadas_IDok.csv",sep=""))
+```
+
+# 1. Modelo CFA e índice de ruralidad
+
+## 1.1 Especificación y ajuste del modelo
+
+Modelo final: un factor latente de ruralidad con ocho indicadores y una covarianza residual entre agua pública y recolección de basura. La electricidad pública se sacó del modelo (carga baja y fuente de residuos altos). Siete de los ocho indicadores son del sector; solo `log_dist_limite_m` varía entre escuelas del mismo sector.
+
+
+```{r}
+dat_schools<-dat_schools %>% filter(!is.na(ID))
+
+# La variable pct_n_fuente_elect_publica fue eliminada porque no presentaba suficiente variabilidad y generaba problemas de ajuste
+
+model1 <- '
+  rurality_com =~ pct_n_caenes_A +
+                  pct_n_fuente_agua_publica +
+                  pct_n_basura_servicios +
+                  pct_n_serv_internet_fija +
+                  pct_n_serv_hig_alcantarillado_nuevavar +
+                  pct_n_comb_calefaccion_lenaymas_nuevavar +
+                  log_dens_sector_km2 +
+                  log_dist_limite_m
+                  
+    pct_n_fuente_agua_publica ~~ pct_n_basura_servicios
+'
+
+# NOTA: cluster = "ID" corrige los errores estándar por escuelas del mismo sector; no
+#   cambia las cargas ni los puntajes. Si ID mezclara zonas y localidades por colisión
+#   de códigos, también mezclaría clusters (sugerencia 1).
+fit1 <- cfa(model1,
+            data      = dat_schools,    
+            estimator = "MLR",
+            std.lv    = TRUE,
+            missing   = "fiml",
+            cluster="ID")
+
+summary(fit1, fit.measures = TRUE, standardized = TRUE)
+
+residuos_corr<-as.data.frame(resid(fit1, type='cor')$cov)
+sum(abs(residuos_corr)>=0.1)
+```
+
+## 3.2 Puntajes factoriales
+
+Un puntaje por escuela, con FIML para los datos perdidos. `case.idx` identifica las filas que entraron al modelo, así que los puntajes se pegan por posición correcta aunque lavaan excluya casos sin datos.
+
+```{r puntajes}
+# 1) Puntajes factoriales (un puntaje por escuela, usa los datos disponibles de cada una)
+sc  <- lavPredict(fit1)                      # metodo por defecto, maneja datos perdidos
+idx <- lavInspect(fit1, "case.idx")          # filas de dat_schools que entraron al modelo
+
+dat_schools$ind_rural <- NA_real_
+dat_schools$ind_rural[idx] <- as.numeric(sc[, "rurality_com"])
+
+# 2) orientacion: mayor puntaje = mas rural
+# NOTA: El signo del factor es arbitrario: con std.lv = TRUE queda 'mayor = más rural'
+#   si agricultura y leña cargan positivo. Si hubiera que invertirlo, hacerlo ANTES de
+#   crear ind_rural_100 e ind_rural_q5.
+std <- standardizedSolution(fit1) %>% filter(op == "=~") %>% select(rhs, est.std)
+std     # agricultura y lena deberian son positivas; servicios y densidad, negativas
+
+# Si salieran al reves (agricultura negativa), invertir:
+# dat_schools$ind_rural <- -dat_schools$ind_rural
+
+# 3) Chequeos
+nrow(dat_schools); length(idx); sum(is.na(dat_schools$ind_rural))
+summary(dat_schools$ind_rural)
+
+```
+
+## 3.3 Reescalamiento y categorías
+
+```{r reescalar}
+# Escala 0 a 100 (mayor = mas rural)
+dat_schools$ind_rural_100 <- scales::rescale(dat_schools$ind_rural, to = c(0, 100))
+
+# Categorias por cuantiles (por ejemplo quintiles)
+dat_schools$ind_rural_q5 <- dplyr::ntile(dat_schools$ind_rural, 5)
+
+
+```
+
+## 3.4 Validación del puntaje
+
+Se revisa que el puntaje se relacione con cada indicador en el sentido esperado y que separe a las escuelas rurales oficiales (`RURAL_RBD`).
+
+```{r validacion}
+# Correlacion con cada indicador (los signos deben coincidir con las cargas)
+cor(dat_schools$ind_rural,
+    dat_schools[, c("pct_n_caenes_A", "pct_n_fuente_agua_publica", "pct_n_basura_servicios",
+                    "pct_n_serv_internet_fija", "pct_n_serv_hig_alcantarillado_nuevavar",
+                    "pct_n_comb_calefaccion_lenaymas_nuevavar", "log_dens_sector_km2",
+                    "log_dist_limite_m")],
+    use = "pairwise.complete.obs")
+
+dat_schools %>%
+  group_by(RURAL_RBD) %>%
+  summarise(n = n(), media = mean(ind_rural, na.rm = TRUE), sd = sd(ind_rural, na.rm = TRUE))
+```
+
+## 3.5 Guardar
+
+```{r guardar}
+
+indice_escuelas <- dat_schools %>%
+  mutate(across(any_of(c("ID", "ID_ZONA", "ID_LOCALIDAD")), as.character),
+         across(any_of(c("ind_rural", "ind_rural_100")), ~ round(.x, 3))) %>%
+  select(any_of(c("RBD", "ID", "tipo_unidad", "ind_rural", "ind_rural_100", "ind_rural_q5")))
+
+write.csv2(indice_escuelas, paste0(path_in, "Base de datos/indice_ruralidad_escuelas.csv"), row.names = FALSE)
+write_xlsx(indice_escuelas, paste0(path_in, "Base de datos/indice_ruralidad_escuelas.xlsx"))
+
+```
